@@ -1,0 +1,121 @@
+# import pandas as pd
+import json
+import os
+import warnings
+
+from langchain import SQLDatabase
+from langchain.docstore.document import Document
+from langchain.vectorstores import Chroma
+
+# from langchain.embeddings import HuggingFaceEmbeddings
+
+from sqlalchemy import exc
+from sqlalchemy.exc import SAWarning
+
+warnings.filterwarnings("ignore", category=SAWarning)
+
+
+def get_json(path):
+    """Return json file from specified filepath"""
+    with open(path, "r") as f:
+        json_file = json.load(f)
+
+    return json_file
+
+
+def connect_db(db_path, target_schema):
+    """
+    Try multiple candidate SQLite locations:
+      - <db_path>/<schema>.sqlite
+      - <db_path>/<schema>/<schema>.sqlite
+      - db_path if caller passed a full filename
+    """
+
+    db_filename = f"{target_schema}.sqlite"
+    candidates = [
+        os.path.join(db_path, db_filename),
+        os.path.join(db_path, target_schema, db_filename),
+        db_path,
+    ]
+
+    tried = []
+    for candidate in candidates:
+        candidate_abs = os.path.abspath(candidate)
+        tried.append(candidate_abs)
+        if os.path.exists(candidate_abs) and os.path.isfile(candidate_abs):
+            print(f"Using SQLite DB file: {candidate_abs}")
+            return SQLDatabase.from_uri("sqlite:///" + candidate_abs) # langchain
+
+    raise FileNotFoundError(
+        f"SQLite file for schema '{target_schema}' not found. Tried: {tried}"
+    )
+
+
+# define new document builder
+def prep_chroma_documents(json_path, db_path):
+    """Take json file and work through it to prepare for load to Chroma.
+
+    This version - adding the table info using the langchain SQLDatabase SQLAlchemy wrapper to get table info to add to metadata.
+    Would like to not reconnect to the database each time, but instead connect to each schema once and then loop through the tables. But I think this will be easier for now, even if it's less efficient.
+
+    This works specifically with the content and metadata we want for this project and database
+    """
+    docs = []
+    error_log = set()  # use this to track schemas with errors
+
+    print("\nPrepping documents...")
+    print("Building with schema, table, columns, DDL\n")
+
+    for item in get_json(json_path):
+        # connect to database
+        db = connect_db(db_path=db_path, target_schema=item["schema"])
+
+        # create variables
+        schema = item["schema"]
+        table = item["table"]
+        columns = json.dumps([col["c_name"] for col in item["columns"]])
+
+        try:
+            table_info = db.get_table_info_no_throw(
+                table_names=[table]
+            )  
+        except exc.SQLAlchemyError:
+            table_info = ""
+            error_log.add(schema)
+        except TypeError:
+            table_info = ""
+            error_log.add(schema)
+
+        # create document
+        doc = Document(
+            page_content=f"""
+            Schema: {schema}
+            Table: {table}
+            Columns: {columns}
+            DDL:
+                {table_info}
+            """,
+            metadata={
+                "schema": schema,
+                "table": table,
+                "columns": columns,
+            },
+        )
+        docs.append(doc)
+
+    print("\nErrors on these schemas:")
+    print(error_log)
+    print(
+        "\nDocuments created for these, but only stored schema, table, and column names - no DDL & sample rows."
+    )
+
+    return docs
+
+
+def create_chroma_db(docs, persist_dir, embed_func):
+    """Take in documents, a location to save the database locally, and the function for embedding and creat the vector database"""
+    print("\nCreating vector database...")
+    Chroma.from_documents(
+        documents=docs, embedding=embed_func, persist_directory=persist_dir
+    )
+    print("Success!")
